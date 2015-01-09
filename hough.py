@@ -1,6 +1,7 @@
 import sys
 import math
-from PIL import Image, ImageDraw
+from collections import Counter
+from PIL import Image, ImageDraw, ImageFilter
 from glob import glob
 from math import sin, cos, pi, sqrt
 import os.path
@@ -11,6 +12,10 @@ RHO_STRETCH = 2
 THETA_SIZE = 180
 MAX_PEAKS = 5
 CUTOFF = 5
+
+known_shape_names = {
+    'middle horizontal stroke, center vertical stroke': 'cross'
+}
 
 # TODO: theta coordinate really should wrap instead of being cut off
 def out_of_bounds(img, point):
@@ -148,6 +153,32 @@ def most_prominent(peaks):
     return peaks[:MAX_PEAKS]
     
 
+def describe(peak):
+    strength, (rho, theta) = peak
+    rough_angle = int(round( float(theta)/45.0 ))
+    direction = [
+        'vertical',
+        'upwards diagonal',
+        'horizontal',
+        'downwards diagonal',
+        'vertical'
+    ][rough_angle]
+
+    return direction + ' stroke'
+
+    # TODO: this doesn't work at all, needs to be smarter about directions
+    if direction == 'horizontal':
+        positions = ['top', 'middle', 'bottom']
+    else:
+        positions = ['left', 'center', 'right']
+
+    # TODO: make rho threshold dynamic
+    rho_size = 170.0
+    position_index = int(math.floor(3.0 * rho / rho_size))
+    position = positions[position_index]
+
+    return ' '.join([position, direction, 'stroke'])
+
 
 def detect(filename):
     """ applies the hough transform to detect lines,
@@ -164,8 +195,13 @@ def detect(filename):
 
     output = transform.convert('RGB')
     draw_output = ImageDraw.Draw(output)
+
+    description = ", ".join(sorted( describe(peak) for peak in peaks[0:4] ))
+    description = known_shape_names.get(description, description)
+    print filename, '->', description
+
     for index, (value, peak)  in enumerate(peaks):
-        print filename, repr(peak), value
+        # print filename, repr(peak), value
         for radius in range(3,4):
             if index < 3:
                 color = (255,0,0)
