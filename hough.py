@@ -12,19 +12,30 @@ import math
 from collections import Counter
 from PIL import Image, ImageDraw, ImageFilter
 from glob import glob
-from math import sin, cos, pi, sqrt
+from math import sin, cos, pi, sqrt, floor
 import os.path
 
 SEARCH_GRID = 8
 CLIMB_RANGE = 10
 RHO_STRETCH = 2
 THETA_SIZE = 180
-MAX_PEAKS = 5
-CUTOFF = 5
+
+PEAK_RADIUS = 5
+PEAK_THRESHOLD = 90 # needs 10 pixels contributing
 
 known_shape_names = {
     'middle horizontal stroke, center vertical stroke': 'cross'
 }
+
+
+def mobius_wrap(size, point):
+    # mobius topology
+    if point[1] >= size[1]:
+        return (size[0] + 1 - point[0], point[1] % size[1])
+    elif point[1] < 0:
+        return (size[0] + 1 - point[0], size[1] + point[1])
+    else:
+        return point
 
 
 # TODO: theta coordinate really should wrap instead of being cut off
@@ -42,6 +53,7 @@ def brighten(img, center):
     x, y = center
 
     def bump_pixel(point, vote):
+        point = mobius_wrap(img.size, point)
         if not out_of_bounds(img, point):
             old_value = img.getpixel(point)
             img.putpixel(point, old_value + vote)
@@ -96,76 +108,47 @@ def hough_transform(img):
     return transform
 
 
-def climb_hill(img, start):
-    ''' starting from a point, climbs to the nearest local maxima, which is
-    returned as (height, (x, y))'''
+def find_peaks(img):
 
-    point = start
-    previous_point = None
-    value = img.getpixel(start)
+    peaks = []
 
-    # scan right until we find a non-zero value
-    # TODO: probably better to spiral
-    while value == 0:
-        point = ((point[0]+1) % img.size[0], point[1])
-        if point == start:
-            return value, point
-        value = img.getpixel(point)
+    radius_squared = PEAK_RADIUS ** 2
+    xy_range = range(-int(floor(PEAK_RADIUS)), int(floor(PEAK_RADIUS))+1)
 
-    # climb the hill by moving to the highest neighbor pixel
-    # until a local maxima is reached.
-    climb_range = range(-CLIMB_RANGE, CLIMB_RANGE + 1)
-    while point != previous_point:
-        previous_point = point
-        for dx in climb_range:
-            for dy in climb_range:
-                if dx == 0 and dy == 0:
-                    continue
-                essay = (point[0]+dx, point[1]+dy)
+    for cx in xrange(img.size[0]):
+        for cy in xrange(img.size[1]):
+            center = (cx, cy)
+            center_height = img.getpixel(center)
+            highest_neighbor = 0
+            total_neighbor_height = 0
+            total_neighbor_pixels = 0
+            for dx in xy_range:
+                for dy in xy_range:
+                    neighbor = mobius_wrap(img.size, (cx+dx, cy+dy))
 
-                if essay[1] >= img.size[1]:
-                    # mobious topology
-                    essay = (img.size[0] - essay[0], essay[1] % img.size[1])
+                    if not (dx == 0 and dy == 0 ):
+                        if not out_of_bounds(img, neighbor):
+                            if (dx**2 + dy**2) < radius_squared:
+                                height = img.getpixel(neighbor)
 
-                if not out_of_bounds(img, essay):
-                    essay_value = img.getpixel(essay)
-                    if essay_value > value:
-                        point = essay
-                        value = essay_value
+                                # increment these for the average
+                                total_neighbor_height += height
+                                total_neighbor_pixels += 1
 
-    return int(value), point
+                                # also pick off the maximum
+                                if height > highest_neighbor:
+                                    highest_neighbor = height
 
+            # only include as a peak if it's a clear local maxima
+            if center_height > highest_neighbor:
+                average_neighbor_height = floor(total_neighbor_height / total_neighbor_pixels)
+                relative_height = center_height - average_neighbor_height
+                if relative_height > PEAK_THRESHOLD:
+                    # print 'peaks2: %d at (%d, %d)' % (relative_height, cx, cy)
+                    #peaks.putpixel(center, relative_height)
+                    peaks.append((relative_height, center))
 
-def find_peaks(img, subdivisions):
-    peaks = {}
-
-    dx = img.size[0] // subdivisions
-    dy = img.size[1] // subdivisions
-
-    for i in xrange(subdivisions):
-        for j in xrange(subdivisions):
-            start = (dx * i, dy * j)
-            peak, value = climb_hill(img, start)
-            peaks[peak] = value
-
-    return peaks.items()
-
-
-def most_prominent(peaks):
-    ''' limits peaks to only those in the top half. '''
-
-    if len(peaks) <= 1:
-        return peaks
-    values = [value for value, peak in peaks]
-    threshold = max(values) / CUTOFF
-    peaks = sorted([
-        (v, p) for v, p in peaks if v > threshold
-    ], reverse=True)
-
-    # TODO: collapse nearby peaks to a single value. I can't
-    # implement this until I do segmenting, though.
-
-    return peaks[:MAX_PEAKS]
+    return peaks
 
 
 def describe(peak):
@@ -190,7 +173,7 @@ def describe(peak):
 
     # TODO: make rho threshold dynamic
     rho_size = 170.0
-    position_index = int(math.floor(3.0 * rho / rho_size))
+    position_index = int(floor(3.0 * rho / rho_size))
     position = positions[position_index]
 
     return ' '.join([position, direction, 'stroke'])
@@ -206,8 +189,7 @@ def detect(filename):
 
     img = Image.open(input_filename).convert("L")
     transform = hough_transform(img)
-
-    peaks = most_prominent(find_peaks(transform, SEARCH_GRID))
+    peaks = find_peaks(transform)
 
     output = transform.convert('RGB')
     draw_output = ImageDraw.Draw(output)
@@ -220,10 +202,7 @@ def detect(filename):
     for index, (value, peak) in enumerate(peaks):
         # print filename, repr(peak), value
         for radius in range(3, 4):
-            if index < 3:
-                color = (255, 0, 0)
-            else:
-                color = (0, 0, 200)
+            color = (255, 0, 0)  # red
             draw_output.ellipse(
                 (peak[0]-radius, peak[1]-radius,
                  peak[0]+radius, peak[1]+radius),
