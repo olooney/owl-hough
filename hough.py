@@ -12,7 +12,7 @@ import math
 from collections import Counter
 from PIL import Image, ImageDraw, ImageFilter
 from glob import glob
-from math import sin, cos, pi, sqrt, floor
+from math import sin, cos, tan, pi, sqrt, floor
 import os.path
 
 SEARCH_GRID = 8
@@ -23,9 +23,8 @@ THETA_SIZE = 180
 PEAK_RADIUS = 5
 PEAK_THRESHOLD = 90 # needs 10 pixels contributing
 
-known_shape_names = {
-    'middle horizontal stroke, center vertical stroke': 'cross'
-}
+SEGMENT_FILL_GAP = 3
+SEGMENT_MIN_LENGTH = 7
 
 
 def mobius_wrap(size, point):
@@ -37,6 +36,9 @@ def mobius_wrap(size, point):
     else:
         return point
 
+def rho_offset(img):
+    width, height = img.size
+    return int(max(height, width) * RHO_STRETCH * sqrt(2) + 1)
 
 # TODO: theta coordinate really should wrap instead of being cut off
 def out_of_bounds(img, point):
@@ -83,7 +85,7 @@ def hough_transform(img):
     # through the origin) but the transform image can only handle positive
     # coordinates, so we shift it so that rho = 0 actually lights up a pixel in
     # the centerline of the transform image.
-    offset = int(max(height, width) * RHO_STRETCH * sqrt(2) + 1)
+    offset = rho_offset(img)
     rho_size = offset * 2 + 1
 
     # Modes: http://svn.effbot.org/public/tags/pil-1.1.4/libImaging/Unpack.c
@@ -179,6 +181,128 @@ def describe(peak):
     return ' '.join([position, direction, 'stroke'])
 
 
+def find_segments(img, peak):
+    '''returns endpoints for the segments in the line that are actually active).
+    Several hueristic are used to detect segments. 1st, because the matched line
+    may not perfectly align with the original image, we check the 3x3 grid of pixels
+    surrounded on the point. 2nd, we allow gaps up to a certain threshold; if another
+    pixel is encountered before the gap runs out, the segment continues. This allows
+    for dotted/dashed lines or simply missing an occasional pixel.  Third, only
+    segments above a certain length will be returned. This avoids returning segments
+    for spurious points that happen to be in alignment with the detected feature.
+    '''
+
+    height, (shifted_rho, theta) = peak
+
+    radians = pi * theta / THETA_SIZE
+    # point = (int(round(rho*RHO_STRETCH) + offset+1), theta)
+    rho = int(round((shifted_rho - rho_offset(img) - 1)/RHO_STRETCH))
+
+    if theta < 45 or theta > 135:
+        # line is more vertical, iterate from top to bottom
+        equation = 'x = m y + b'
+        slope = -sin(radians)/cos(radians)
+        intercept = rho / cos(radians)
+
+        def points_in_line():
+            y_range = xrange(0, img.size[1])
+            for y in y_range:
+                x = slope * y + intercept
+                point = (int(x), int(y))
+                if not out_of_bounds(img, point):
+                    yield point
+    else:
+        # line is more horizontal, iterate from left to right
+        equation = 'y = m x + b'
+        slope = -cos(radians)/sin(radians)
+        intercept = rho / sin(radians)
+
+        def points_in_line():
+            x_range = xrange(0, img.size[0])
+            for x in x_range:
+                y = slope * x + intercept
+                point = (int(x), int(y))
+                if not out_of_bounds(img, point):
+                    yield point
+
+    def sample_pixel(point):
+        point = mobius_wrap(img.size, point)
+        if not out_of_bounds(img, point):
+            return img.getpixel(point)
+        else:
+            return 255
+
+    def sample_region(point):
+        x, y = point
+        return min((
+            sample_pixel((x+0, y+0)),
+            sample_pixel((x+1, y+0)),
+            sample_pixel((x-1, y+0)),
+            sample_pixel((x+0, y+1)),
+            sample_pixel((x+0, y-1)),
+            sample_pixel((x+1, y+1)),
+            sample_pixel((x-1, y-1)),
+            sample_pixel((x+1, y-1)),
+            sample_pixel((x-1, y+1)),
+        ))
+            
+    segments = []
+    inside = False
+    run_length = 0
+    gap_length = 0
+    start_point = None
+    end_point = None
+    for point in points_in_line():
+        # only requires a single pixel in the 3x3 region to be lit up.
+        filled = sample_region(point) < 192
+        # print '    pixel:', point, 'ON' if filled else 'OFF', run_length, gap_length
+        if filled and inside:
+            run_length += 1
+            gap_length = 0
+            end_point = point
+        elif filled and not inside:
+            start_point = point
+            end_point = point
+            inside = True
+            gap_length = 0
+            run_length = 0
+        elif not filled and inside:
+            gap_length += 1
+            if gap_length > SEGMENT_FILL_GAP:
+                if run_length >= SEGMENT_MIN_LENGTH:
+                    if start_point != None and end_point != None:
+                        segments.append({
+                            "start": start_point,
+                            "end": end_point,
+                            "rho": rho,
+                            "theta": theta,
+                            "pixels": run_length,
+                        })
+                    else:
+                        print 'start_point and end_point should be populated by this point...'
+                inside = False
+                run_length = 0
+                gap_length = 0
+                end_point = None
+                start_point = None
+        elif not filled and not inside:
+            start_point = None
+            end_point = None
+            run_length = 0
+            gap_length = 0
+
+    if inside and start_point and end_point and run_length >= SEGMENT_MIN_LENGTH:
+        segments.append({
+            "start": start_point,
+            "end": end_point,
+            "rho": rho,
+            "theta": theta,
+            "pixels": run_length,
+        })
+    return segments
+                
+
+
 def detect(filename):
     """ applies the hough transform to detect lines,
         reduces those to segments, then saves a new
@@ -186,18 +310,30 @@ def detect(filename):
 
     input_filename = os.path.join('problems', filename)
     output_filename = os.path.join('solutions', filename)
+    reconstruction_filename = os.path.join('reconstruction', filename)
 
     img = Image.open(input_filename).convert("L")
     transform = hough_transform(img)
     peaks = find_peaks(transform)
 
+    reconstruction = img.convert('RGB')
+    draw_reconstruction = ImageDraw.Draw(reconstruction)
+    for peak in peaks:
+        # print 'peak:', repr(peak)
+        segments = find_segments(img, peak)
+        for segment in segments:
+            start = segment['start']
+            end = segment['end']
+            print '  segment:', start, '->', end, segment['pixels'], 'pixel line at', segment['theta'], 'degrees'
+            draw_reconstruction.line((start, end), fill=(0,200,0))
+    reconstruction.save(reconstruction_filename)
+
     output = transform.convert('RGB')
     draw_output = ImageDraw.Draw(output)
 
-    peak_descriptions = [describe(peak) for peak in peaks[0:4]]
-    description = ", ".join(sorted(peak_descriptions))
-    description = known_shape_names.get(description, description)
-    print filename, '->', description
+    # peak_descriptions = [describe(peak) for peak in peaks[0:4]]
+    # description = ", ".join(sorted(peak_descriptions))
+    # print filename, '->', description
 
     for index, (value, peak) in enumerate(peaks):
         # print filename, repr(peak), value
