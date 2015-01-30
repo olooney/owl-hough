@@ -14,21 +14,27 @@ from PIL import Image, ImageDraw, ImageFilter
 from glob import glob
 from math import sin, cos, tan, pi, sqrt, floor
 import os.path
+import logging
 
-SEARCH_GRID = 8
-CLIMB_RANGE = 10
-RHO_STRETCH = 2
-THETA_SIZE = 180
+# initialize loggin
+logger = logging.getLogger(__name__)
 
-PEAK_RADIUS = 5
-PEAK_THRESHOLD = 90 # needs 10 pixels contributing
+# constants for the Hough transform proper
+RHO_STRETCH = 2  # stretch rho dimension by a factor of two
+THETA_SIZE = 180  # use 1 degree granularity
 
-SEGMENT_FILL_GAP = 3
-SEGMENT_MIN_LENGTH = 7
+PEAK_RADIUS = 5  # compare peaks against a neighborhood of this radius
+PEAK_THRESHOLD = 90  # need 10 pixels or contributing to the line
+
+SEGMENT_FILL_GAP = 3  # can have a gap of three pixels before it splits
+SEGMENT_MIN_LENGTH = 7  # segments below this length will be discarded
 
 
 def mobius_wrap(size, point):
-    # mobius topology
+    '''given a point possibly outside a region, map it to a point within in the
+    image as if the top-edge joined to bottom edge with a 180 degree twist.'''
+
+    # TODO: wrap X too? (not super important, actually)
     if point[1] >= size[1]:
         return (size[0] + 1 - point[0], point[1] % size[1])
     elif point[1] < 0:
@@ -36,12 +42,18 @@ def mobius_wrap(size, point):
     else:
         return point
 
+
 def rho_offset(img):
+    '''map a real rho value, which may be negative and non-integer, to a
+    strictly positive integer value that can be used as a pixel coordinate on
+    the image.'''
+
     width, height = img.size
     return int(max(height, width) * RHO_STRETCH * sqrt(2) + 1)
 
-# TODO: theta coordinate really should wrap instead of being cut off
+
 def out_of_bounds(img, point):
+    '''returns false iff the point is a legal pixel in the image.'''
     if point[0] < 0 or point[1] < 0:
         return True
     if point[0] >= img.size[0]:
@@ -52,6 +64,12 @@ def out_of_bounds(img, point):
 
 
 def brighten(img, center):
+    '''brightens a 3x3 pixel area in an image around a center point
+    in an appoximately guassian pattern.'''
+
+    # TODO: this effect could be acheived more efficiently by
+    # applying guassian blur to the transform image afterwards.
+
     x, y = center
 
     def bump_pixel(point, vote):
@@ -60,13 +78,16 @@ def brighten(img, center):
             old_value = img.getpixel(point)
             img.putpixel(point, old_value + vote)
 
+    # center
     bump_pixel((x, y), 9)
 
+    # compass points
     bump_pixel((x+1, y+0), 5)
     bump_pixel((x-1, y+0), 5)
     bump_pixel((x+0, y+1), 5)
     bump_pixel((x+0, y-1), 5)
 
+    # diagonals
     bump_pixel((x+1, y+1), 2)
     bump_pixel((x-1, y-1), 2)
     bump_pixel((x+1, y-1), 2)
@@ -111,9 +132,17 @@ def hough_transform(img):
 
 
 def find_peaks(img):
+    '''returns a list of (height, (x,y)) representing distinct local maxima
+    in the image that are significantly higher than any surrounding pixels.'''
+
+    # Each point is compared to a circular region of pixels surrounding it.
+    # This region is called the neighborhood, and its members are called
+    # neighbors.  the center point is NOT part of the neighborhood.  The peak
+    # must be larger than all its neighbors (which is slightly stronger then
+    # simply being a local maxima) and must also be significantly higher than
+    # the average of its neighborhood to qualify as a "peak".
 
     peaks = []
-
     radius_squared = PEAK_RADIUS ** 2
     xy_range = range(-int(floor(PEAK_RADIUS)), int(floor(PEAK_RADIUS))+1)
 
@@ -121,76 +150,50 @@ def find_peaks(img):
         for cy in xrange(img.size[1]):
             center = (cx, cy)
             center_height = img.getpixel(center)
+
+            # compute the average and maximum of the neighborhood
             highest_neighbor = 0
-            total_neighbor_height = 0
-            total_neighbor_pixels = 0
+            total_height = 0
+            pixel_count = 0
             for dx in xy_range:
                 for dy in xy_range:
                     neighbor = mobius_wrap(img.size, (cx+dx, cy+dy))
 
-                    if not (dx == 0 and dy == 0 ):
+                    if not (dx == 0 and dy == 0):
                         if not out_of_bounds(img, neighbor):
                             if (dx**2 + dy**2) < radius_squared:
                                 height = img.getpixel(neighbor)
 
                                 # increment these for the average
-                                total_neighbor_height += height
-                                total_neighbor_pixels += 1
+                                total_height += height
+                                pixel_count += 1
 
                                 # also pick off the maximum
                                 if height > highest_neighbor:
                                     highest_neighbor = height
 
-            # only include as a peak if it's a clear local maxima
+            # determine eligibility for peak-hood
             if center_height > highest_neighbor:
-                average_neighbor_height = floor(total_neighbor_height / total_neighbor_pixels)
-                relative_height = center_height - average_neighbor_height
+                average_height = floor(total_height / pixel_count)
+                relative_height = center_height - average_height
                 if relative_height > PEAK_THRESHOLD:
-                    # print 'peaks2: %d at (%d, %d)' % (relative_height, cx, cy)
-                    #peaks.putpixel(center, relative_height)
-                    peaks.append((relative_height, center))
+                    peak = (relative_height, center)
+                    logger.debug('peak detected: %s', repr(peak))
+                    peaks.append(peak)
 
     return peaks
 
 
-def describe(peak):
-    '''attempts to describe a peak in human understandable terms'''
-    strength, (rho, theta) = peak
-    rough_angle = int(round(float(theta)/45.0))
-    direction = [
-        'vertical',
-        'upwards diagonal',
-        'horizontal',
-        'downwards diagonal',
-        'vertical'
-    ][rough_angle]
-
-    return direction + ' stroke'
-
-    # TODO: this doesn't work at all, needs to be smarter about directions
-    if direction == 'horizontal':
-        positions = ['top', 'middle', 'bottom']
-    else:
-        positions = ['left', 'center', 'right']
-
-    # TODO: make rho threshold dynamic
-    rho_size = 170.0
-    position_index = int(floor(3.0 * rho / rho_size))
-    position = positions[position_index]
-
-    return ' '.join([position, direction, 'stroke'])
-
-
 def find_segments(img, peak):
-    '''returns endpoints for the segments in the line that are actually active).
-    Several hueristic are used to detect segments. 1st, because the matched line
-    may not perfectly align with the original image, we check the 3x3 grid of pixels
-    surrounded on the point. 2nd, we allow gaps up to a certain threshold; if another
-    pixel is encountered before the gap runs out, the segment continues. This allows
-    for dotted/dashed lines or simply missing an occasional pixel.  Third, only
-    segments above a certain length will be returned. This avoids returning segments
-    for spurious points that happen to be in alignment with the detected feature.
-    '''
+    '''returns endpoints for the segments in the line that are actually
+    active).  Several hueristic are used to detect segments. 1st, because the
+    matched line may not perfectly align with the original image, we check the
+    3x3 grid of pixels surrounded on the point. 2nd, we allow gaps up to a
+    certain threshold; if another pixel is encountered before the gap runs out,
+    the segment continues. This allows for dotted/dashed lines or simply
+    missing an occasional pixel.  Third, only segments above a certain length
+    will be returned. This avoids returning segments for spurious points that
+    happen to be in alignment with the detected feature.  '''
 
     height, (shifted_rho, theta) = peak
 
@@ -245,7 +248,7 @@ def find_segments(img, peak):
             sample_pixel((x+1, y-1)),
             sample_pixel((x-1, y+1)),
         ))
-            
+
     segments = []
     inside = False
     run_length = 0
@@ -255,7 +258,14 @@ def find_segments(img, peak):
     for point in points_in_line():
         # only requires a single pixel in the 3x3 region to be lit up.
         filled = sample_region(point) < 192
-        # print '    pixel:', point, 'ON' if filled else 'OFF', run_length, gap_length
+
+        logger.debug(
+            '    pixel: %s %s %d %d',
+            repr(point),
+            'ON' if filled else 'OFF',
+            run_length,
+            gap_length)
+
         if filled and inside:
             run_length += 1
             gap_length = 0
@@ -270,16 +280,13 @@ def find_segments(img, peak):
             gap_length += 1
             if gap_length > SEGMENT_FILL_GAP:
                 if run_length >= SEGMENT_MIN_LENGTH:
-                    if start_point != None and end_point != None:
-                        segments.append({
-                            "start": start_point,
-                            "end": end_point,
-                            "rho": rho,
-                            "theta": theta,
-                            "pixels": run_length,
-                        })
-                    else:
-                        print 'start_point and end_point should be populated by this point...'
+                    segments.append({
+                        "start": start_point,
+                        "end": end_point,
+                        "rho": rho,
+                        "theta": theta,
+                        "pixels": run_length,
+                    })
                 inside = False
                 run_length = 0
                 gap_length = 0
@@ -291,7 +298,7 @@ def find_segments(img, peak):
             run_length = 0
             gap_length = 0
 
-    if inside and start_point and end_point and run_length >= SEGMENT_MIN_LENGTH:
+    if inside and run_length >= SEGMENT_MIN_LENGTH:
         segments.append({
             "start": start_point,
             "end": end_point,
@@ -300,59 +307,97 @@ def find_segments(img, peak):
             "pixels": run_length,
         })
     return segments
-                
 
 
-def detect(filename):
+def detect_line_segments(filename):
     """ applies the hough transform to detect lines,
         reduces those to segments, then saves a new
         image with the segments draw on top of the original."""
 
+    # read and interpret the image
     input_filename = os.path.join('problems', filename)
-    output_filename = os.path.join('solutions', filename)
-    reconstruction_filename = os.path.join('reconstruction', filename)
-
+    logger.info('detecting line segments in %s', input_filename)
     img = Image.open(input_filename).convert("L")
     transform = hough_transform(img)
     peaks = find_peaks(transform)
 
+    # save the reconstruction as an image
     reconstruction = img.convert('RGB')
     draw_reconstruction = ImageDraw.Draw(reconstruction)
     for peak in peaks:
-        # print 'peak:', repr(peak)
+        logger.debug('peak: %s', repr(peak))
         segments = find_segments(img, peak)
         for segment in segments:
             start = segment['start']
             end = segment['end']
-            print '  segment:', start, '->', end, segment['pixels'], 'pixel line at', segment['theta'], 'degrees'
-            draw_reconstruction.line((start, end), fill=(0,200,0))
+
+            logger.info(
+                '  segment: %s -> %s, %d pixels at %d degrees',
+                repr(start),
+                repr(end),
+                segment['pixels'],
+                segment['theta'])
+
+            # show the segment as a green line
+            draw_reconstruction.line((start, end), fill=(0, 200, 0))
+
+    reconstruction_filename = os.path.join('reconstruction', filename)
     reconstruction.save(reconstruction_filename)
+    logger.info('saved %s', reconstruction_filename)
 
-    output = transform.convert('RGB')
-    draw_output = ImageDraw.Draw(output)
+    # save the transform to an image for visual inspection
 
-    # peak_descriptions = [describe(peak) for peak in peaks[0:4]]
-    # description = ", ".join(sorted(peak_descriptions))
-    # print filename, '->', description
-
-    for index, (value, peak) in enumerate(peaks):
-        # print filename, repr(peak), value
+    transform_with_peaks = transform.convert('RGB')
+    draw_transform_with_peaks = ImageDraw.Draw(transform_with_peaks)
+    for (height, point) in peaks:
         for radius in range(3, 4):
             color = (255, 0, 0)  # red
-            draw_output.ellipse(
-                (peak[0]-radius, peak[1]-radius,
-                 peak[0]+radius, peak[1]+radius),
+            draw_transform_with_peaks.ellipse(
+                (point[0]-radius, point[1]-radius,
+                 point[0]+radius, point[1]+radius),
                 outline=color)
+
+    output = combine(quadruple(img), transform_with_peaks, quadruple(reconstruction))
+    output_filename = os.path.join('solutions', filename)
     output.save(output_filename)
+    logger.info('saved %s', output_filename)
+
+
+def quadruple(img):
+    width, height = img.size
+    return img.resize( (width*4, height*4) )
+
+
+def combine(*imgs):
+    '''helper function to combine multiple images into one'''
+
+    width = sum(img.size[0] + 10 for img in imgs)
+    height = max(img.size[1] + 10 for img in imgs) 
+    background_color = (128, 128, 128)  # grey
+    combined = Image.new('RGB', (width, height), background_color)
+
+    offset = 5
+    for img in imgs:
+        combined.paste(img, (offset, 5 + (height - img.size[1])//2 ))
+        offset += img.size[0] + 10
+
+    return combined 
 
 
 if __name__ == '__main__':
-    problem_filter = sys.argv[1] if len(sys.argv) > 1 else ''
+    # display output
+    logger.setLevel(logging.DEBUG)
+    log_writer = logging.StreamHandler(sys.stdout)
+    log_writer.setLevel(logging.INFO)
+    logger.addHandler(log_writer)
 
-    def solve_if(name):
-        if name.startswith(problem_filter):
-            detect(name)
+    problem_filter = sys.argv[1] if len(sys.argv) > 1 else ''
 
     for path in glob('problems/*.*'):
         name = os.path.basename(path)
-        solve_if(name)
+        if name.startswith(problem_filter):
+            try:
+                detect_line_segments(name)
+            except Exception, ex:
+                logger.error("Error while detecting line segments", exc_info=True)
+
